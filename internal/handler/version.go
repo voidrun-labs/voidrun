@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type VersionHandler struct {}
+type VersionHandler struct{}
 
 func NewVersionHandler() *VersionHandler {
 	return &VersionHandler{}
