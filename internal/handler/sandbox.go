@@ -110,10 +110,13 @@ func (h *SandboxHandler) Create(c *gin.Context) {
 	}
 	req.OrgID = orgIDVal.(string)
 
-	// userIDVal, ok := c.Get("userID")
-	// if ok {
-	// 	req.UserID = userIDVal.(string)
-	// }
+	userIdVal, ok := c.Get("userID")
+
+	if !ok {
+		c.JSON(http.StatusUnauthorized, model.NewErrorResponse("missing user context", ""))
+		return
+	}
+	req.UserID = userIdVal.(string)
 
 	spec, err := h.sandboxService.Create(c.Request.Context(), req)
 	if err != nil {
@@ -146,16 +149,16 @@ func (h *SandboxHandler) Restore(c *gin.Context) {
 	}
 
 	// Validate CPU count
-	if req.CPU < minCPU || req.CPU > maxCPU {
+	if req.CPU != 0 && (req.CPU < minCPU || req.CPU > maxCPU) {
 		c.JSON(http.StatusBadRequest, model.NewErrorResponse(
-			"invalid cpu count: must be between 1 and 16",
+			"invalid cpu count: must be between 1 and 8",
 			"",
 		))
 		return
 	}
 
 	// Validate Memory (MiB)
-	if req.Mem < minMemMiB || req.Mem > maxMemMiB {
+	if req.Mem != 0 && (req.Mem < minMemMiB || req.Mem > maxMemMiB) {
 		c.JSON(http.StatusBadRequest, model.NewErrorResponse(
 			"invalid memory size: must be between 1 GiB and 16 GiB",
 			"",
@@ -195,16 +198,40 @@ func (h *SandboxHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox deleted", nil))
 }
 
+func (h *SandboxHandler) Start(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.sandboxService.Start(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("start failed", err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox started", nil))
+}
+
 func (h *SandboxHandler) Stop(c *gin.Context) {
-	h.sandboxAction(c, "stop", h.sandboxService.Stop)
+	id := c.Param("id")
+	if err := h.sandboxService.Stop(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("stop failed", err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox stopped", nil))
 }
 
 func (h *SandboxHandler) Pause(c *gin.Context) {
-	h.sandboxAction(c, "pause", h.sandboxService.Pause)
+	id := c.Param("id")
+	if err := h.sandboxService.Pause(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("pause failed", err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox paused", nil))
 }
 
 func (h *SandboxHandler) Resume(c *gin.Context) {
-	h.sandboxAction(c, "resume", h.sandboxService.Resume)
+	id := c.Param("id")
+	if err := h.sandboxService.Resume(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("resume failed", err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox resumed", nil))
 }
 
 func (h *SandboxHandler) Snapshot(c *gin.Context) {

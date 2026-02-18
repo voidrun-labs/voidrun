@@ -188,7 +188,7 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 	}
 
 	bootStart := time.Now()
-	if err := machine.Start(*s.cfg, spec, overlay, ""); err != nil {
+	if err := machine.Create(*s.cfg, spec, overlay, ""); err != nil {
 		fmt.Printf("❌ CRITICAL BOOT ERROR: %v\n", err)
 		cleanup()
 		return nil, fmt.Errorf("boot failed: %w", err)
@@ -212,6 +212,7 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 
 	// Save to DB as pointer with OrgID and CreatedBy
 	orID, _ := util.ParseObjectID(req.OrgID)
+	userId, _ := util.ParseObjectID(req.UserID)
 
 	// Set environment variables on the agent if provided
 	if len(req.EnvVars) > 0 {
@@ -233,6 +234,7 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 		EnvVars:   req.EnvVars, // Store env vars in the sandbox record
 		Status:    "running",
 		CreatedAt: time.Now(),
+		UserID:    userId,
 	}
 	err = s.repo.Create(ctx, sandbox)
 	if err != nil {
@@ -266,24 +268,32 @@ func (s *SandboxService) Restore(ctx context.Context, req model.RestoreSandboxRe
 	// Apply defaults
 	cpu := req.CPU
 	if cpu == 0 {
-		cpu = 1
+		cpu = s.cfg.Sandbox.DefaultVCPUs
 	}
 	mem := req.Mem
 	if mem == 0 {
-		mem = 1024
+		mem = s.cfg.Sandbox.DefaultMemoryMB
 	}
 	diskMB := s.cfg.Sandbox.DefaultDiskMB
 
 	// Perform restore
-	if err := machine.Restore(*s.cfg, instanceID, req.SnapshotPath, ip, req.Cold); err != nil {
+	if err := machine.Restore(*s.cfg, instanceID, req.SnapshotPath, ip, req.Cold, cpu, mem); err != nil {
 		return "", fmt.Errorf("restore failed: %w", err)
 	}
 
 	// Save to DB using Create with context
-	orID, _ := util.ParseObjectID(req.OrgID)
+	orID, err := util.ParseObjectID(req.OrgID)
+	if err != nil {
+		_ = machine.Delete(instanceID)
+		return "", fmt.Errorf("invalid org id: %w", err)
+	}
 	var createdBy primitive.ObjectID
 	if req.UserID != "" {
-		createdBy, _ = util.ParseObjectID(req.UserID)
+		createdBy, err = util.ParseObjectID(req.UserID)
+		if err != nil {
+			_ = machine.Delete(instanceID)
+			return "", fmt.Errorf("invalid user id: %w", err)
+		}
 	}
 	sandbox := &model.Sandbox{
 		ID:        objID,
@@ -298,8 +308,11 @@ func (s *SandboxService) Restore(ctx context.Context, req model.RestoreSandboxRe
 		Status:    "running",
 		CreatedAt: time.Now(),
 	}
-	err := s.repo.Create(ctx, sandbox)
+	err = s.repo.Create(ctx, sandbox)
 	if err != nil {
+		if cleanupErr := machine.Delete(instanceID); cleanupErr != nil {
+			return "", fmt.Errorf("failed to save restored sandbox: %w (cleanup failed: %v)", err, cleanupErr)
+		}
 		return "", fmt.Errorf("failed to save restored sandbox: %w", err)
 	}
 
@@ -326,22 +339,163 @@ func (s *SandboxService) Delete(ctx context.Context, id string) error {
 	return s.repo.Delete(ctx, objID)
 }
 
-func (s *SandboxService) Stop(id string) error {
+func (s *SandboxService) Start(ctx context.Context, id string) error {
+	// Get sandbox from DB
+	sandbox, err := s.repo.FindByID(ctx, id)
+	if err != nil || sandbox == nil {
+		return fmt.Errorf("sandbox not found: %s", id)
+	}
+
+	// Verify it's stopped
+	if sandbox.Status != "stopped" {
+		return fmt.Errorf("sandbox is not stopped (current status: %s)", sandbox.Status)
+	}
+
+	sbxID := sandbox.ID.Hex()
+	socketPath := machine.GetSocketPath(sbxID)
+
+	// Check if hypervisor is running (socket exists)
+	client := machine.NewCLHClient(socketPath)
+	if client.IsSocketAvailable() {
+		// Warm start - hypervisor running, just boot the VM
+		log.Printf("[Start] Warm start for sandbox %s\n", sbxID)
+		if err := machine.Start(sbxID); err != nil {
+			return fmt.Errorf("failed to start VM: %w", err)
+		}
+	} else {
+		// Cold start - hypervisor not running, need to recreate
+		log.Printf("[Start] Cold start for sandbox %s - recreating VM\n", sbxID)
+
+		// Build spec from DB data
+		spec := model.SandboxSpec{
+			ID:        sbxID,
+			CPUs:      sandbox.CPU,
+			MemoryMB:  sandbox.Mem,
+			DiskMB:    sandbox.DiskMB,
+			IPAddress: sandbox.IP,
+		}
+
+		// Get existing overlay path
+		overlayPath := machine.GetOverlayPath(sbxID)
+
+		// Recreate the VM (boots it automatically)
+		if err := machine.Create(*s.cfg, spec, overlayPath, ""); err != nil {
+			return fmt.Errorf("failed to recreate VM: %w", err)
+		}
+
+		// Wait for agent
+		if err := waitForAgent(sbxID, 30*time.Second); err != nil {
+			return fmt.Errorf("agent not ready after restart: %w", err)
+		}
+	}
+
+	// Update status to running
+	objID, _ := util.ParseObjectID(id)
+	if err := s.repo.UpdateStatus(ctx, objID, "running"); err != nil {
+		// VM is running but DB update failed - log but don't fail
+		fmt.Printf("[WARN] VM started but failed to update DB status: %v\n", err)
+	}
+
+	// Register with metrics
+	if s.metrics != nil {
+		spec := model.SandboxSpec{
+			ID:       sbxID,
+			CPUs:     sandbox.CPU,
+			MemoryMB: sandbox.Mem,
+			DiskMB:   sandbox.DiskMB,
+		}
+		s.metrics.RegisterSandbox(spec.ID, sandbox.Name, machine.GetSocketPath(spec.ID), spec.CPUs, spec.MemoryMB, spec.DiskMB)
+	}
+
+	return nil
+}
+
+func (s *SandboxService) Stop(ctx context.Context, id string) error {
 	if err := machine.Stop(id); err != nil {
 		return err
 	}
 	if s.metrics != nil {
 		s.metrics.UnregisterSandbox(id)
 	}
+
+	// Update database status to stopped
+	objID, err := util.ParseObjectID(id)
+	if err != nil {
+		return fmt.Errorf("invalid ID format: %w", err)
+	}
+	if err := s.repo.UpdateStatus(ctx, objID, "stopped"); err != nil {
+		return fmt.Errorf("failed to update status: %w", err)
+	}
+
 	return nil
 }
 
-func (s *SandboxService) Pause(id string) error {
-	return machine.Pause(id)
+// EnsureRunning checks if sandbox is running and starts it if stopped (auto-start feature)
+func (s *SandboxService) EnsureRunning(ctx context.Context, id string) error {
+	// Get sandbox from DB to check status
+	sandbox, err := s.repo.FindByID(ctx, id)
+	if err != nil || sandbox == nil {
+		return fmt.Errorf("sandbox not found: %s", id)
+	}
+
+	// If already running, return immediately
+	if sandbox.Status == "running" {
+		return nil
+	}
+
+	// If stopped, start it
+	if sandbox.Status == "stopped" {
+		log.Printf("[Auto-Start] Sandbox %s is stopped, starting...\n", id)
+		if err := s.Resume(ctx, id); err != nil {
+			return fmt.Errorf("failed to auto-start sandbox: %w", err)
+		}
+
+		// Wait for agent to be ready
+		if err := waitForAgent(sandbox.ID.Hex(), 30*time.Second); err != nil {
+			return fmt.Errorf("agent not ready after start: %w", err)
+		}
+
+		log.Printf("[Auto-Start] Sandbox %s started and ready\n", id)
+		return nil
+	}
+
+	// Other states
+	return fmt.Errorf("sandbox in unexpected state for auto-start: %s", sandbox.Status)
 }
 
-func (s *SandboxService) Resume(id string) error {
-	return machine.Resume(id)
+func (s *SandboxService) Pause(ctx context.Context, id string) error {
+	if err := machine.Pause(id); err != nil {
+		return err
+	}
+
+	// Update database status to paused
+	objID, err := util.ParseObjectID(id)
+	if err != nil {
+		return fmt.Errorf("invalid ID format: %w", err)
+	}
+	if err := s.repo.UpdateStatus(ctx, objID, "paused"); err != nil {
+		return fmt.Errorf("failed to update status: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SandboxService) Resume(ctx context.Context, id string) error {
+	if err := machine.Resume(id); err != nil {
+		log.Printf("[ERROR] Failed to resume sandbox %s: %v\n", id, err)
+		return err
+	}
+
+	// Update database status to running
+	objID, err := util.ParseObjectID(id)
+	if err != nil {
+		return fmt.Errorf("invalid ID format: %w", err)
+	}
+	if err := s.repo.UpdateStatus(ctx, objID, "running"); err != nil {
+		return fmt.Errorf("failed to update status: %w", err)
+	}
+
+	return nil
 }
 
 func (s *SandboxService) Info(id string) (string, error) {
@@ -492,8 +646,7 @@ func (s *SandboxService) RefreshStatuses(ctx context.Context) error {
 
 // GetSnapshotsBasePath returns the base path for snapshots
 func (s *SandboxService) GetSnapshotsBasePath(id string) string {
-	pwd, _ := filepath.Abs(".")
-	return filepath.Join(pwd, "instances", id, "snapshots")
+	return filepath.Join(s.cfg.Paths.InstancesDir, id, "snapshots")
 }
 
 func waitForAgent(sbxID string, timeout time.Duration) error {
@@ -678,14 +831,12 @@ func setAgentEnvVars(sbxID string, envVars map[string]string) error {
 		return fmt.Errorf("failed to marshal env vars: %w", err)
 	}
 
-	// Make HTTP request to agent's /env endpoint
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Call agent's /env endpoint
 	resp, err := AgentCommand(ctx, nil, sbxID, bytes.NewReader(jsonData), "/env", http.MethodPost)
 	if err != nil {
-		return fmt.Errorf("failed to call agent /env endpoint: %w", err)
+		return fmt.Errorf("failed to call agent: %w", err)
 	}
 	defer resp.Body.Close()
 

@@ -202,50 +202,6 @@ func (s *ExecService) ExecStreamSSE(ctx context.Context, sbxID string, command s
 	return nil
 }
 
-// ExecuteCommandStream executes a command and streams NDJSON output with separate stdout/stderr
-func (s *ExecService) ExecuteCommandStream(sbxID, cmd string, args []string, timeout int, writer io.Writer, flush func()) error {
-	// Use common DialVsock helper
-	conn, err := machine.DialVsock(sbxID, 1024, 2*time.Second)
-	if err != nil {
-		return fmt.Errorf("sandbox not reachable: %w", err)
-	}
-	defer conn.Close()
-
-	// Send request
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	agentReq := map[string]interface{}{
-		"cmd":     cmd,
-		"args":    args,
-		"timeout": timeout,
-	}
-	if err := json.NewEncoder(conn).Encode(agentReq); err != nil {
-		return fmt.Errorf("failed to send command: %w", err)
-	}
-
-	// Clear deadline for streaming
-	conn.SetReadDeadline(time.Time{})
-
-	// Proxy NDJSON chunks (agent already sends stdout/stderr separately)
-	buffer := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buffer)
-		if n > 0 {
-			if _, werr := writer.Write(buffer[:n]); werr == nil && flush != nil {
-				flush()
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				return err
-			}
-			break
-		}
-	}
-
-	return nil
-}
-
 // ExecAgentCommand sends a JSON command payload to the agent /exec endpoint over HTTP.
 // Shared helper so FS and Exec services reuse identical logic.
 func ExecAgentCommand(ctx context.Context, client *http.Client, sbxID string, body io.Reader) (*http.Response, error) {
@@ -253,6 +209,11 @@ func ExecAgentCommand(ctx context.Context, client *http.Client, sbxID string, bo
 }
 
 func AgentCommand(ctx context.Context, client *http.Client, sbxID string, body io.Reader, path string, method string) (*http.Response, error) {
+	// Auto-start sandbox if stopped
+	// if err := ensureSandboxRunning(sbxID); err != nil {
+	// 	return nil, fmt.Errorf("failed to ensure sandbox running: %w", err)
+	// }
+
 	if client == nil {
 		client = sandboxclient.GetSandboxHTTPClient()
 	}

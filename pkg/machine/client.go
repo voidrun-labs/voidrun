@@ -212,8 +212,6 @@ func (c *APIClient) GetStateWithContext(ctx context.Context) (string, error) {
 	return info.State, nil
 }
 
-// Path helpers
-
 func GetInstanceDir(sbxID string) string {
 	return fmt.Sprintf("%s/%s", InstancesRoot, sbxID)
 }
@@ -232,4 +230,20 @@ func GetPIDPath(sbxID string) string {
 
 func GetTapPath(sbxID string) string {
 	return fmt.Sprintf("%s/%s/vm.tap", InstancesRoot, sbxID)
+}
+
+func GetLogPath(sbxID string) string {
+	return fmt.Sprintf("%s/%s/vm.log", InstancesRoot, sbxID)
+}
+
+func GetOverlayPath(sbxID string) string {
+	return fmt.Sprintf("%s/%s/overlay.qcow2", InstancesRoot, sbxID)
+}
+
+func GetSnapshotsDir(sbxID string) string {
+	return fmt.Sprintf("%s/%s/snapshots", InstancesRoot, sbxID)
+}
+
+func GetSnapshotTempDir(sbxID string) string {
+	return fmt.Sprintf("%s/%s/snapshot_temp", InstancesRoot, sbxID)
 }

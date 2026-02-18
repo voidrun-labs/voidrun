@@ -41,16 +41,19 @@ func AuthMiddleware(apiKeySvc *service.APIKeyService) gin.HandlerFunc {
 		}
 
 		orgId := keyDoc.OrgID.Hex()
+		userId := keyDoc.CreatedBy.Hex()
 		log.Printf("Authenticated request using API key ID: %s for Org ID: %s", keyDoc.ID.Hex(), orgId)
 
 		// Inject orgID and a generic role for org API access
 		ctx := context.WithValue(c.Request.Context(), CtxOrgIDKey, orgId)
 		ctx = context.WithValue(ctx, CtxUserRoleKey, "org_api")
+		ctx = context.WithValue(ctx, CtxUserIDKey, userId)
 		c.Request = c.Request.WithContext(ctx)
 
 		// Also expose in gin context for handlers that read from gin
 		c.Set("orgID", orgId)
 		c.Set("role", "org_api")
+		c.Set("userID", userId)
 
 		c.Next()
 	}

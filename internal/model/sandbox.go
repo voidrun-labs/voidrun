@@ -20,6 +20,7 @@ type Sandbox struct {
 	CreatedBy primitive.ObjectID `bson:"createdBy" json:"createdBy"`
 	OrgID     primitive.ObjectID `bson:"orgId" json:"orgId"`
 	EnvVars   map[string]string  `bson:"envVars,omitempty" json:"envVars,omitempty"`
+	UserID    primitive.ObjectID `bson:"userId" json:"userId"`
 }
 
 type SandboxSpec struct {

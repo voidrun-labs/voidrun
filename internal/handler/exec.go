@@ -44,6 +44,12 @@ func (h *ExecHandler) Exec(c *gin.Context) {
 		return
 	}
 
+	// Auto-start sandbox if stopped
+	if err := h.sandboxService.EnsureRunning(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusServiceUnavailable, model.NewErrorResponse("Failed to ensure sandbox is running", err.Error()))
+		return
+	}
+
 	sbxInstance := sandbox.ID.Hex()
 
 	var req model.ExecRequest
