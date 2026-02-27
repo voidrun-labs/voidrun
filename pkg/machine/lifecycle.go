@@ -3,13 +3,17 @@ package machine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"voidrun/internal/config"
@@ -18,21 +22,16 @@ import (
 	"voidrun/pkg/timer"
 )
 
-// Create handles Fresh Boot (API Injection) and Restore (API Restore)
-func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, restorePath string) error {
-	defer timer.Track("Sandbox Start (Total)")()
+const defaultNetDeviceID = "net0"
+
+func ConfigureNetwork(cfg config.Config, spec *model.SandboxSpec) error {
+
 	fmt.Printf("   [CONFIG] Bridge Name: '%s'\n", cfg.Network.BridgeName)
 	fmt.Printf("   [CONFIG] TAP Prefix: '%s'\n", cfg.Network.TapPrefix)
 	fmt.Printf("   [CONFIG] Instances Dir: '%s'\n", cfg.Paths.InstancesDir)
 
-	overlayPath, _ = filepath.Abs(overlayPath)
-
 	// Use centralized path helpers
-	socketPath := GetSocketPath(spec.ID)
-	logPath := GetLogPath(spec.ID)
-	pidPath := GetPIDPath(spec.ID)
 	tapPath := GetTapPath(spec.ID)
-	vsockPath := GetVsockPath(spec.ID)
 
 	// Generate MAC based on IP
 	macAddr := network.GenerateMAC(spec.IPAddress)
@@ -45,10 +44,122 @@ func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, resto
 		return err
 	}
 
+	spec.TapName = tapName
+	spec.MacAddress = macAddr
+
 	log.Printf("   [Net] Created TAP interface %s\n", tapName)
 
 	// Save TAP name for cleanup later
 	os.WriteFile(tapPath, []byte(tapName), 0644)
+
+	return nil
+}
+
+func CreateFromSnapshot(cfg config.Config, spec model.SandboxSpec) error {
+	defaultBaseSnapshotDir := cfg.Paths.DefaultBaseSnapshot
+	baseOverlay := path.Join(defaultBaseSnapshotDir, "overlay.qcow2")
+	baseSnapshot := path.Join(defaultBaseSnapshotDir, "memory")
+
+	log.Printf(">> Restoring from snapshot. Base Overlay: %s, Base Snapshot: %s\n", baseOverlay, baseSnapshot)
+	if _, err := os.Stat(baseOverlay); os.IsNotExist(err) {
+		return fmt.Errorf("base overlay missing at path: %s (ensure you have created the base snapshot)", baseOverlay)
+	}
+	if _, err := os.Stat(baseSnapshot); os.IsNotExist(err) {
+		return fmt.Errorf("base snapshot missing at path: %s (ensure you have created the base snapshot)", baseSnapshot)
+	}
+
+	// copy base overlay to new location for CLH to use (we don't want to modify the original base snapshot)
+	overlayPath := GetOverlayPath(spec.ID)
+	if err := os.MkdirAll(GetInstanceDir(spec.ID), 0755); err != nil {
+		return fmt.Errorf("failed to create instance dir: %w", err)
+	}
+	log.Printf("   [+] Copying base overlay to %s\n", overlayPath)
+	cp := func() {
+		defer timer.Track("Copy Base Overlay")()
+		if out, err := exec.Command("cp", baseOverlay, overlayPath).CombinedOutput(); err != nil {
+			// return fmt.Errorf("failed to copy base overlay: %w: %s", err, string(out))
+			log.Printf("❌ Failed to copy base overlay: %v, output: %s\n", err, string(out))
+		}
+	}
+
+	cp()
+
+	// Create the VM using the copied overlay and the base snapshot for RAM state
+	// if err := Create(cfg, spec, overlayPath, baseSnapshot); err != nil {
+	// 	return fmt.Errorf("failed to create VM from snapshot: %w", err)
+	// }
+
+	tapName := spec.TapName
+	vsockPath := GetVsockPath(spec.ID)
+
+	fmt.Printf("   [+] Restoring from snapshot: %s\n", baseSnapshot)
+	absRestorePath, _ := filepath.Abs(baseSnapshot)
+	if err := rewriteRestoreState(absRestorePath, overlayPath, tapName, vsockPath); err != nil {
+		Stop(spec.ID)
+		return fmt.Errorf("restore state rewrite failed: %w", err)
+	}
+
+	// Use centralized path helpers
+	logPath := GetLogPath(spec.ID)
+	pidPath := GetPIDPath(spec.ID)
+	// vsockPath := GetVsockPath(spec.ID)pw
+
+	// 3. Start "Empty" Cloud Hypervisor Process
+	clhPath, _ := exec.LookPath("cloud-hypervisor")
+	args := []string{
+		"--api-socket", GetSocketPath(spec.ID),
+		"--restore", fmt.Sprintf("file://%s", absRestorePath),
+		"--kernel", cfg.Paths.KernelPath,
+		"--memory", fmt.Sprintf("size=%dM,mergeable=on,shared=on", spec.MemoryMB),
+		"--cpus", fmt.Sprintf("boot=%d,max=%d", spec.CPUs, spec.CPUs),
+		"--disk", fmt.Sprintf("path=%s", overlayPath),
+		"--net", fmt.Sprintf("tap=%s,mac=%s", tapName, spec.MacAddress),
+		"--vsock", fmt.Sprintf("cid=%d,socket=%s", getCidFromIP(spec.IPAddress), vsockPath),
+		"--log-file", GetLogPath(spec.ID),
+	}
+
+	fmt.Printf(">> [Native] Spawning empty CLH process (API Mode)...\n")
+	cmd := exec.Command(clhPath, args...)
+
+	// Redirect IO
+	logFile, _ := os.Create(logPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Daemonize
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("process start failed: %v", err)
+	}
+
+	// Save PID before releasing process handle
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		cmd.Process.Kill()
+		return err
+	}
+	cmd.Process.Release()
+
+	if err := network.EnableTap(cfg.Network.BridgeName, tapName); err != nil {
+		Stop(spec.ID)
+		return fmt.Errorf("network attach failed (bridge: %s, tap: %s): %v", cfg.Network.BridgeName, tapName, err)
+	}
+
+	fmt.Printf("   [+] VM Active! PID: %d, Tap: %s\n", tapName, pid)
+
+	return nil
+}
+
+// Create handles Fresh Boot (API Injection) and Restore (API Restore)
+func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, restorePath string) error {
+	defer timer.Track("Sandbox Start (Total)")()
+
+	overlayPath, _ = filepath.Abs(overlayPath)
+
+	// Use centralized path helpers
+	socketPath := GetSocketPath(spec.ID)
+	logPath := GetLogPath(spec.ID)
+	pidPath := GetPIDPath(spec.ID)
+	vsockPath := GetVsockPath(spec.ID)
 
 	// 3. Start "Empty" Cloud Hypervisor Process
 	clhPath, _ := exec.LookPath("cloud-hypervisor")
@@ -87,21 +198,32 @@ func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, resto
 		return fmt.Errorf("VM crashed on start. Logs:\n%s", string(logs))
 	}
 
+	tapName := spec.TapName
+	macAddr := spec.MacAddress
+	log.Printf("   [Create] spec.TapName=%q, spec.MacAddress=%q, restorePath=%q\n", tapName, macAddr, restorePath)
+
 	// 5. Inject Configuration via API
 	if restorePath != "" {
 		// === RESTORE MODE ===
 		fmt.Printf("   [+] Restoring from snapshot: %s\n", restorePath)
 		absRestorePath, _ := filepath.Abs(restorePath)
+		if err := rewriteRestoreState(absRestorePath, overlayPath, tapName, vsockPath); err != nil {
+			Stop(spec.ID)
+			return fmt.Errorf("restore state rewrite failed: %w", err)
+		}
 
 		// Restore Config
 		restoreConfig := &RestoreConfig{
 			SourceURL: fmt.Sprintf("file://%s", absRestorePath),
 			// We re-attach network config here
-			Net: []NetConfig{{Tap: tapName, Mac: macAddr}},
+			Net: []NetConfig{{ID: defaultNetDeviceID, Tap: tapName, Mac: macAddr}},
 		}
 
-		clhClient := NewCLHClient(socketPath)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Live restore can take longer than normal API operations.
+		// Keep client timeout aligned with restore context to avoid premature client aborts.
+		restoreTimeout := 2 * time.Minute
+		clhClient := NewCLHClientWithTimeout(socketPath, restoreTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
 		defer cancel()
 
 		if err := clhClient.VmRestore(ctx, restoreConfig); err != nil {
@@ -113,43 +235,14 @@ func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, resto
 		// === FRESH BOOT MODE ===
 		fmt.Println("   [+] Injecting Configuration via API...")
 
-		iface := "eth0"
-		gateway := cfg.Network.GetCleanGateway()
-		netmask := cfg.Network.GetNetmask()
-
-		hostname := "voidrun"
-
-		kernelIPArgs := fmt.Sprintf(
-			"ip=%s::%s:%s:%s:%s:off",
-			spec.IPAddress,
-			gateway,
-			netmask,
-			hostname,
-			iface,
-		)
-
-		envVars := ""
-
 		debugConsole := cfg.Sandbox.DebugBootConsole
-		if debugConsole {
-			log.Printf("   [Boot] Debug console enabled (vm log: %s)", logPath)
-		}
-		consoleArgs := "console=hvc0"
-		if debugConsole {
-			consoleArgs = "console=ttyS0 console=hvc0"
-		}
 
-		cmdLine := fmt.Sprintf(
-			"%s root=/dev/vda rw init=/sbin/init net.ifnames=0 biosdevname=0 %s %s",
-			consoleArgs,
-			kernelIPArgs,
-			envVars,
-		)
+		cmdLine := strings.TrimSpace(cfg.Sandbox.KernelCmdline)
 		log.Printf("   [Kernel] CmdLine: %s\n", cmdLine)
 
 		payload := PayloadConfig{
 			Kernel:  cfg.Paths.KernelPath,
-			Cmdline: cmdLine, // Use Cmdline (lowercase 'l') for JSON marshaling
+			Cmdline: cmdLine,
 		}
 		if cfg.Paths.InitrdPath != "" {
 			initrdPath, _ := filepath.Abs(cfg.Paths.InitrdPath)
@@ -177,8 +270,7 @@ func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, resto
 			Disks: []DiskConfig{
 				{Path: overlayPath},
 			},
-			// Remove IP from here (Kernel handles it), just pass Layer 2 info
-			Net: []NetConfig{{Tap: tapName, Mac: macAddr}},
+			Net: []NetConfig{{ID: defaultNetDeviceID, Tap: tapName, Mac: macAddr}},
 			Rng: &RngConfig{Src: "/dev/urandom"},
 			Serial: &ConsoleConfig{Mode: func() string {
 				if debugConsole {
@@ -216,8 +308,6 @@ func Create(cfg config.Config, spec model.SandboxSpec, overlayPath string, resto
 		}
 	}
 
-	fmt.Printf("   [Net] Config Bridge Name: %s\n", cfg.Network.BridgeName)
-	fmt.Printf("   [Net] Attaching %s to bridge %s...\n", tapName, cfg.Network.BridgeName)
 	if err := network.EnableTap(cfg.Network.BridgeName, tapName); err != nil {
 		Stop(spec.ID)
 		return fmt.Errorf("network attach failed (bridge: %s, tap: %s): %v", cfg.Network.BridgeName, tapName, err)
@@ -275,11 +365,6 @@ func Start(id string) error {
 	if err := client.VmBoot(ctx); err != nil {
 		return fmt.Errorf("vm.boot failed: %w", err)
 	}
-
-	// Wait for VM to reach running state
-	// if err := WaitForVMState(ctx, client, VmStateRunning, 5*time.Second); err != nil {
-	// 	fmt.Printf("Warning: VM did not reach running state: %v\n", err)
-	// }
 
 	fmt.Printf("   [+] VM %s Started.\n", id)
 	return nil
@@ -379,16 +464,16 @@ func Info(id string) (string, error) {
 func CreateSnapshot(sbxID string) error {
 	log.Printf(">> Creating snapshot for Sandbox ID: %s\n", sbxID)
 
-	client := NewCLHClientForSandbox(sbxID)
+	socketPath := GetSocketPath(sbxID)
+	client := NewCLHClientWithTimeout(socketPath, 2*time.Minute)
 	if !client.IsSocketAvailable() {
 		return fmt.Errorf("Sandbox socket not found. Is Sandbox running?")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	// Check Sandbox state
-	state, err := client.GetState(ctx)
+	stateCtx, stateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	state, err := client.GetState(stateCtx)
+	stateCancel()
 	log.Printf("   [+] Current State: %s\n", state)
 	if err != nil {
 		return fmt.Errorf("failed to get Sandbox state: %w", err)
@@ -400,7 +485,10 @@ func CreateSnapshot(sbxID string) error {
 
 	// Pause if running
 	if state == VmStateRunning {
-		if err := client.VmPause(ctx); err != nil {
+		pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := client.VmPause(pauseCtx)
+		pauseCancel()
+		if err != nil {
 			return fmt.Errorf("pause failed: %w", err)
 		}
 		fmt.Println("   [+] Sandbox Paused")
@@ -416,6 +504,7 @@ func CreateSnapshot(sbxID string) error {
 	tempStateDir := GetSnapshotTempDir(sbxID)
 	_ = os.RemoveAll(tempStateDir)
 	if err := os.MkdirAll(tempStateDir, 0755); err != nil {
+		_ = os.RemoveAll(snapDir)
 		return fmt.Errorf("failed to prepare snapshot temp dir: %w", err)
 	}
 
@@ -423,11 +512,18 @@ func CreateSnapshot(sbxID string) error {
 
 	// Trigger snapshot
 	snapshotURL := fmt.Sprintf("file://%s", tempStateDir)
-	if err := client.VmSnapshot(ctx, snapshotURL); err != nil {
+	snapshotCtx, snapshotCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err = client.VmSnapshot(snapshotCtx, snapshotURL)
+	snapshotCancel()
+	if err != nil {
+		cleanupErr := cleanupPaths(snapDir, tempStateDir)
 		if state == VmStateRunning {
 			resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = client.VmResume(resumeCtx)
 			resumeCancel()
+		}
+		if cleanupErr != nil {
+			return fmt.Errorf("snapshot failed: %w (cleanup failed: %v)", err, cleanupErr)
 		}
 		return fmt.Errorf("snapshot failed: %w", err)
 	}
@@ -465,24 +561,34 @@ func Restore(cfg config.Config, newID, snapshotPath, ip string, cold bool, cpu, 
 	newInstanceDir := GetInstanceDir(newID)
 	log.Printf(">> Restoring Sandbox ID: %s from Snapshot: %s\n", newID, snapshotPath)
 
-	if _, err := os.Stat(newInstanceDir); err == nil {
-		return fmt.Errorf("Sandbox ID %s already exists", newID)
+	dstDisk := ""
+
+	cc := func() error {
+		defer timer.Track("copy disk & other")()
+		if _, err := os.Stat(newInstanceDir); err == nil {
+			return fmt.Errorf("Sandbox ID %s already exists", newID)
+		}
+
+		if err := os.MkdirAll(newInstanceDir, 0755); err != nil {
+			return fmt.Errorf("failed to create instance dir: %w", err)
+		}
+
+		// Restore disk using path helpers
+		srcDisk := filepath.Join(snapshotPath, "overlay.qcow2")
+		dstDisk = GetOverlayPath(newID)
+
+		fmt.Println("   [+] Copying Disk...")
+		if err := exec.Command("cp", srcDisk, dstDisk).Run(); err != nil {
+			os.RemoveAll(newInstanceDir)
+			return fmt.Errorf("disk copy failed: %w", err)
+		}
+
+		return nil
 	}
 
-	if err := os.MkdirAll(newInstanceDir, 0755); err != nil {
-		return fmt.Errorf("failed to create instance dir: %w", err)
+	if err := cc(); err != nil {
+		return err
 	}
-
-	// Restore disk using path helpers
-	srcDisk := filepath.Join(snapshotPath, "overlay.qcow2")
-	dstDisk := GetOverlayPath(newID)
-
-	fmt.Println("   [+] Copying Disk...")
-	if err := exec.Command("cp", srcDisk, dstDisk).Run(); err != nil {
-		os.RemoveAll(newInstanceDir)
-		return fmt.Errorf("disk copy failed: %w", err)
-	}
-
 	// Logic Branch: Cold vs Live
 	var dstState string
 	if !cold {
@@ -492,7 +598,7 @@ func Restore(cfg config.Config, newID, snapshotPath, ip string, cold bool, cpu, 
 
 		fmt.Printf("   [+] Copying RAM State from %s to %s\n", srcState, dstState)
 		if err := exec.Command("cp", "-r", srcState, dstState).Run(); err != nil {
-			os.RemoveAll(newInstanceDir)
+			_ = os.RemoveAll(newInstanceDir)
 			return fmt.Errorf("state copy failed: %w", err)
 		}
 	} else {
@@ -507,8 +613,20 @@ func Restore(cfg config.Config, newID, snapshotPath, ip string, cold bool, cpu, 
 		MemoryMB:  memoryMB,
 	}
 
+	// Configure network (creates TAP device)
+	log.Printf("   [Restore] Before ConfigureNetwork: spec.TapName=%q, spec.MacAddress=%q\n", spec.TapName, spec.MacAddress)
+	if err := ConfigureNetwork(cfg, &spec); err != nil {
+		_ = os.RemoveAll(newInstanceDir)
+		return fmt.Errorf("network config failed: %w", err)
+	}
+	log.Printf("   [Restore] After ConfigureNetwork: spec.TapName=%q, spec.MacAddress=%q\n", spec.TapName, spec.MacAddress)
+
 	// Start process
 	if err := Create(cfg, spec, dstDisk, dstState); err != nil {
+		// Ensure host-side resources (tap/pid/socket) are fully cleaned on failed restore.
+		_ = Delete(newID)
+		_ = network.DeleteTap(spec.TapName)
+		_ = os.RemoveAll(newInstanceDir)
 		return err
 	}
 
@@ -581,5 +699,196 @@ func finalizeSnapshot(sbxID, snapDir, tempStateDir string) error {
 	}
 
 	log.Printf("   [+] Snapshot finalized: %s\n", snapDir)
+	return nil
+}
+
+func cleanupPaths(paths ...string) error {
+	var firstErr error
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("   [!] Failed to clean up %s: %v", path, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+type rewritePair struct {
+	old string
+	new string
+}
+
+func rewriteRestoreState(restorePath, newDiskPath, newTapName, newVsockPath string) error {
+	defer timer.Track("rewriteRestoreState")()
+	configPath := filepath.Join(restorePath, "config.json")
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config.json: %w", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(rawConfig, &cfg); err != nil {
+		return fmt.Errorf("parse config.json: %w", err)
+	}
+
+	var replacements []rewritePair
+
+	if disks, ok := cfg["disks"].([]any); ok {
+		for _, diskEntry := range disks {
+			disk, ok := diskEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if old, ok := disk["path"].(string); ok {
+				old = strings.TrimSpace(old)
+				if old != "" {
+					replacements = append(replacements, rewritePair{old: old, new: newDiskPath})
+				}
+			}
+			disk["path"] = newDiskPath
+		}
+	}
+
+	if nets, ok := cfg["net"].([]any); ok {
+		for _, netEntry := range nets {
+			netCfg, ok := netEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if old, ok := netCfg["tap"].(string); ok {
+				old = strings.TrimSpace(old)
+				if old != "" {
+					replacements = append(replacements, rewritePair{old: old, new: newTapName})
+				}
+			}
+			netCfg["tap"] = newTapName
+		}
+	}
+
+	if vsock, ok := cfg["vsock"].(map[string]any); ok {
+		if old, ok := vsock["socket"].(string); ok {
+			old = strings.TrimSpace(old)
+			if old != "" {
+				replacements = append(replacements, rewritePair{old: old, new: newVsockPath})
+			}
+		}
+		vsock["socket"] = newVsockPath
+	}
+
+	// Some CLH versions persist fs sockets in state. Keep them instance-local.
+	if fsEntries, ok := cfg["fs"].([]any); ok {
+		for _, fsEntry := range fsEntries {
+			fsCfg, ok := fsEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			old, ok := fsCfg["socket"].(string)
+			if !ok {
+				continue
+			}
+			old = strings.TrimSpace(old)
+			if old == "" {
+				continue
+			}
+			base := filepath.Base(old)
+			newSocket := filepath.Join(filepath.Dir(newVsockPath), base)
+			replacements = append(replacements, rewritePair{old: old, new: newSocket})
+			fsCfg["socket"] = newSocket
+		}
+	}
+
+	normalized := dedupeReplacements(replacements)
+
+	updatedConfig, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config.json: %w", err)
+	}
+
+	if err := writeRewriteTarget(configPath, updatedConfig); err != nil {
+		return err
+	}
+
+	statePath := filepath.Join(restorePath, "state.json")
+	if err := rewriteStateFile(statePath, normalized); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func dedupeReplacements(in []rewritePair) []rewritePair {
+	unique := make(map[string]string, len(in))
+	for _, p := range in {
+		old := strings.TrimSpace(p.old)
+		newVal := strings.TrimSpace(p.new)
+		if old == "" || newVal == "" || old == newVal {
+			continue
+		}
+		unique[old] = newVal
+	}
+
+	out := make([]rewritePair, 0, len(unique))
+	for old, newVal := range unique {
+		out = append(out, rewritePair{old: old, new: newVal})
+	}
+
+	// Replace longer paths first to avoid partial substitutions.
+	slices.SortFunc(out, func(a, b rewritePair) int {
+		if len(a.old) == len(b.old) {
+			if a.old < b.old {
+				return -1
+			}
+			if a.old > b.old {
+				return 1
+			}
+			return 0
+		}
+		if len(a.old) > len(b.old) {
+			return -1
+		}
+		return 1
+	})
+
+	return out
+}
+
+func rewriteStateFile(statePath string, replacements []rewritePair) error {
+	rawState, err := os.ReadFile(statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read state.json: %w", err)
+	}
+
+	rewritten := string(rawState)
+	for _, r := range replacements {
+		rewritten = strings.ReplaceAll(rewritten, r.old, r.new)
+		rewritten = strings.ReplaceAll(
+			rewritten,
+			strings.ReplaceAll(r.old, "/", "\\/"),
+			strings.ReplaceAll(r.new, "/", "\\/"),
+		)
+	}
+
+	if string(rawState) == rewritten {
+		return nil
+	}
+
+	return writeRewriteTarget(statePath, []byte(rewritten))
+}
+
+func writeRewriteTarget(path string, data []byte) error {
+	if err := os.Chmod(path, 0o644); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
 	return nil
 }

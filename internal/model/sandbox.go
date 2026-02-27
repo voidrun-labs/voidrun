@@ -24,13 +24,15 @@ type Sandbox struct {
 }
 
 type SandboxSpec struct {
-	ID        string            `json:"id"`
-	Type      string            `json:"type"`
-	CPUs      int               `json:"cpus"`
-	MemoryMB  int               `json:"memory_mb"`
-	DiskMB    int               `json:"disk_mb"`
-	IPAddress string            `json:"ip_address"`
-	EnvVars   map[string]string `json:"env_vars"`
+	ID         string            `json:"id"`
+	Type       string            `json:"type"`
+	CPUs       int               `json:"cpus"`
+	MemoryMB   int               `json:"memory_mb"`
+	DiskMB     int               `json:"disk_mb"`
+	IPAddress  string            `json:"ip_address"`
+	EnvVars    map[string]string `json:"env_vars"`
+	TapName    string            `json:"tap_name"`
+	MacAddress string            `json:"mac_address"`
 }
 
 // Snapshot represents a sandbox snapshot summary

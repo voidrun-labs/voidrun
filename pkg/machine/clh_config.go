@@ -8,7 +8,6 @@ type CLHConfig = VmConfig
 type PayloadConfig struct {
 	Kernel    string `json:"kernel,omitempty"`
 	Cmdline   string `json:"cmdline,omitempty"`
-	CmdLine   string `json:"-"` // Alias for Cmdline
 	Initramfs string `json:"initramfs,omitempty"`
 	Firmware  string `json:"firmware,omitempty"`
 }
@@ -18,7 +17,7 @@ type CpusConfig struct {
 	BootVcpus   int           `json:"boot_vcpus"`
 	MaxVcpus    int           `json:"max_vcpus"`
 	Topology    *CpuTopology  `json:"topology,omitempty"`
-	KvmHyperv   interface{}   `json:"kvm_hyperv,omitempty"` // Can be bool or object depending on CLH version  
+	KvmHyperv   interface{}   `json:"kvm_hyperv,omitempty"` // Can be bool or object depending on CLH version
 	MaxPhysBits int           `json:"max_phys_bits,omitempty"`
 	Affinity    []CpuAffinity `json:"affinity,omitempty"`
 	Features    *CpuFeatures  `json:"features,omitempty"`

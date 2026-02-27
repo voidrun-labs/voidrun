@@ -240,10 +240,14 @@ func GetOverlayPath(sbxID string) string {
 	return fmt.Sprintf("%s/%s/overlay.qcow2", InstancesRoot, sbxID)
 }
 
+func GetSnapshotsRoot() string {
+	return fmt.Sprintf("%s/snapshots", InstancesRoot)
+}
+
 func GetSnapshotsDir(sbxID string) string {
-	return fmt.Sprintf("%s/%s/snapshots", InstancesRoot, sbxID)
+	return fmt.Sprintf("%s/%s", GetSnapshotsRoot(), sbxID)
 }
 
 func GetSnapshotTempDir(sbxID string) string {
-	return fmt.Sprintf("%s/%s/snapshot_temp", InstancesRoot, sbxID)
+	return fmt.Sprintf("%s/%s/.tmp", GetSnapshotsRoot(), sbxID)
 }

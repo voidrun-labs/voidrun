@@ -56,12 +56,6 @@ func New(cfg *config.Config) (*Server, error) {
 
 	router := setupRouter(cfg, handlers, services)
 
-	if metricsManager != nil {
-		if err := services.Sandbox.RegisterMetricsForExisting(context.Background()); err != nil {
-			fmt.Printf("[metrics] initial registration failed: %v\n", err)
-		}
-	}
-
 	return &Server{
 		cfg:      cfg,
 		router:   router,
@@ -169,7 +163,7 @@ func setupRouter(cfg *config.Config, h *Handlers, s *Services) *gin.Engine {
 
 	// Protected routes require X-API-Key
 	protected := api.Group("")
-	protected.Use(middleware.AuthMiddleware(s.APIKey))
+	protected.Use(middleware.AuthMiddleware(s.APIKey, s.Org))
 
 	// Sandbox routes
 	sandboxes := protected.Group("/sandboxes")
@@ -181,10 +175,11 @@ func setupRouter(cfg *config.Config, h *Handlers, s *Services) *gin.Engine {
 		sandboxes.DELETE("/:id", h.Sandbox.Delete)
 		sandboxes.POST("/:id/start", h.Sandbox.Start)
 		sandboxes.POST("/:id/stop", h.Sandbox.Stop)
-		// sandboxes.POST("/:id/pause", h.Sandbox.Pause)
-		// sandboxes.POST("/:id/resume", h.Sandbox.Resume)
+		sandboxes.POST("/:id/pause", h.Sandbox.Pause)
+		sandboxes.POST("/:id/resume", h.Sandbox.Resume)
 		sandboxes.POST("/:id/snapshot", h.Sandbox.Snapshot)
 		sandboxes.GET("/:id/snapshots", h.Sandbox.ListSnapshots)
+		sandboxes.DELETE("/:id/snapshots/:snapshotId", h.Sandbox.DeleteSnapshot)
 		sandboxes.POST("/:id/exec", h.Exec.Exec)
 		sandboxes.POST("/:id/exec-stream", h.Exec.ExecStream)
 		sandboxes.POST("/:id/session-exec", h.Exec.SessionExec)
@@ -242,6 +237,7 @@ func setupRouter(cfg *config.Config, h *Handlers, s *Services) *gin.Engine {
 	org := protected.Group("/orgs")
 	{
 		org.GET("/me", h.Org.GetCurrentOrg)
+		org.GET("/:orgId/users", h.Org.GetOrgUsers)
 
 		// API key routes under org
 		apiKeys := org.Group("/:orgId/apikeys")

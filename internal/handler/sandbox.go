@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -257,6 +258,25 @@ func (h *SandboxHandler) ListSnapshots(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, snaps)
+}
+
+func (h *SandboxHandler) DeleteSnapshot(c *gin.Context) {
+	id := c.Param("id")
+	snapshotID := c.Param("snapshotId")
+
+	if err := h.sandboxService.DeleteSnapshot(id, snapshotID); err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidSnapshotID):
+			c.JSON(http.StatusBadRequest, model.NewErrorResponse("invalid snapshot id", ""))
+		case errors.Is(err, service.ErrSnapshotNotFound):
+			c.JSON(http.StatusNotFound, model.NewErrorResponse("snapshot not found", ""))
+		default:
+			c.JSON(http.StatusInternalServerError, model.NewErrorResponse("failed to delete snapshot", err.Error()))
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, model.NewSuccessResponse("Snapshot deleted", nil))
 }
 
 func (h *SandboxHandler) Upload(c *gin.Context) {
