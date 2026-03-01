@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,33 +25,24 @@ import (
 	"voidrun/pkg/util"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo/options"
-)
-
-var (
-	ErrInvalidSnapshotID = errors.New("invalid snapshot id")
-	ErrSnapshotNotFound  = errors.New("snapshot not found")
 )
 
 // SandboxService handles sandbox business logic
 type SandboxService struct {
-	repo              repository.ISandboxRepository
-	imageRepo         repository.IImageRepository
-	cfg               *config.Config
-	metrics           *metrics.Manager
-	snapshotMu        sync.RWMutex
-	snapshotsInFlight map[string]struct{}
+	repo      repository.ISandboxRepository
+	imageRepo repository.IImageRepository
+	cfg       *config.Config
+	metrics   *metrics.Manager
 }
 
 // NewSandboxService creates a new sandbox service
 func NewSandboxService(cfg *config.Config, repo repository.ISandboxRepository, imageRepo repository.IImageRepository, metricsManager *metrics.Manager) *SandboxService {
 	return &SandboxService{
-		repo:              repo,
-		imageRepo:         imageRepo,
-		cfg:               cfg,
-		metrics:           metricsManager,
-		snapshotsInFlight: make(map[string]struct{}),
+		repo:      repo,
+		imageRepo: imageRepo,
+		cfg:       cfg,
+		metrics:   metricsManager,
 	}
 }
 
@@ -187,15 +176,10 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 		IPAddress: ip,
 	}
 
-	// this flag is used to determine whether to use a snapshot (if true) or create a new overlay from the base image (if false)
-	// in snapshot way, default debian snapshot dir will be used to create new sbx
-	useSnapshot := false
-	overlay := ""
-
 	// Rollback function for cleanup on failure
 	cleanup := func() {
 		fmt.Printf("   [!] Rollback: Deleting failed instance %s\n", spec.ID)
-		os.RemoveAll(filepath.Dir(overlay))
+		os.RemoveAll(machine.GetInstanceDir(spec.ID))
 	}
 
 	if err := machine.ConfigureNetwork(*s.cfg, &spec); err != nil {
@@ -204,26 +188,16 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 		return nil, fmt.Errorf("boot failed: %w", err)
 	}
 
-	if useSnapshot {
-		if err := machine.CreateFromSnapshot(*s.cfg, spec); err != nil {
-			fmt.Printf("❌ CRITICAL BOOT ERROR: %v\n", err)
-			cleanup()
-			return nil, fmt.Errorf("boot failed: %w", err)
-		}
+	// Prepare storage (pass config by value, not pointer)
+	overlay, err := storage.PrepareInstance(ctx, *s.cfg, spec)
+	if err != nil {
+		return nil, fmt.Errorf("storage init failed: %w", err)
+	}
 
-	} else {
-		// Prepare storage (pass config by value, not pointer)
-		overlay, err := storage.PrepareInstance(ctx, *s.cfg, spec)
-		if err != nil {
-			return nil, fmt.Errorf("storage init failed: %w", err)
-		}
-
-		if err := machine.Create(*s.cfg, spec, overlay, ""); err != nil {
-			fmt.Printf("❌ CRITICAL BOOT ERROR: %v\n", err)
-			cleanup()
-			return nil, fmt.Errorf("boot failed: %w", err)
-		}
-
+	if err := machine.Create(*s.cfg, spec, overlay); err != nil {
+		fmt.Printf("❌ CRITICAL BOOT ERROR: %v\n", err)
+		cleanup()
+		return nil, fmt.Errorf("boot failed: %w", err)
 	}
 
 	netCfg := buildAgentNetConfig(s.cfg, spec.IPAddress, req.Name)
@@ -293,110 +267,6 @@ func (s *SandboxService) Create(ctx context.Context, req model.CreateSandboxRequ
 	return sandbox, nil
 }
 
-func (s *SandboxService) Restore(ctx context.Context, req model.RestoreSandboxRequest) (string, error) {
-	// Auto-assign IP if not provided
-	ip := req.NewIP
-	if ip == "" {
-		var err error
-		ip, err = s.repo.NextAvailableIP()
-		if err != nil {
-			return "", fmt.Errorf("IP allocation failed: %w", err)
-		}
-	}
-
-	// Generate ObjectID for filesystem-safe directory name
-	objID := util.GenerateObjectID()
-	instanceID := objID.Hex()
-
-	// Apply defaults
-	cpu := req.CPU
-	if cpu == 0 {
-		cpu = s.cfg.Sandbox.DefaultVCPUs
-	}
-	mem := req.Mem
-	if mem == 0 {
-		mem = s.cfg.Sandbox.DefaultMemoryMB
-	}
-	diskMB := s.cfg.Sandbox.DefaultDiskMB
-
-	// Perform restore.
-	coldRestore := req.Cold
-	restoreErr := machine.Restore(*s.cfg, instanceID, req.SnapshotPath, ip, coldRestore, cpu, mem)
-
-	// if restoreErr != nil && !coldRestore && shouldFallbackToColdRestore(restoreErr) {
-	// 	log.Printf("[restore] live restore failed for %s, retrying cold restore: %v", instanceID, restoreErr)
-	// 	coldRestore = true
-	// 	restoreErr = machine.Restore(*s.cfg, instanceID, req.SnapshotPath, ip, coldRestore, cpu, mem)
-	// }
-	if restoreErr != nil {
-		return "", fmt.Errorf("restore failed: %w", restoreErr)
-	}
-
-	readyTimeout := time.Duration(s.cfg.Sandbox.SyncTimeoutSec) * time.Second
-	if readyTimeout <= 0 {
-		readyTimeout = 5 * time.Second
-	}
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), readyTimeout)
-	defer dialCancel()
-	if err := waitForAgentDial(dialCtx, instanceID); err != nil {
-		_ = machine.Delete(instanceID)
-		return "", fmt.Errorf("restored sandbox agent not ready: %w", err)
-	}
-
-	// Save to DB using Create with context
-	orID, err := util.ParseObjectID(req.OrgID)
-	if err != nil {
-		_ = machine.Delete(instanceID)
-		return "", fmt.Errorf("invalid org id: %w", err)
-	}
-	var createdBy primitive.ObjectID
-	if req.UserID != "" {
-		createdBy, err = util.ParseObjectID(req.UserID)
-		if err != nil {
-			_ = machine.Delete(instanceID)
-			return "", fmt.Errorf("invalid user id: %w", err)
-		}
-	}
-	sandbox := &model.Sandbox{
-		ID:        objID,
-		Name:      req.NewID, // Store the user-provided name
-		ImageId:   "snapshot",
-		IP:        ip,
-		CPU:       cpu,
-		Mem:       mem,
-		DiskMB:    diskMB,
-		OrgID:     orID,
-		CreatedBy: createdBy,
-		Status:    "running",
-		CreatedAt: time.Now(),
-	}
-	err = s.repo.Create(ctx, sandbox)
-	if err != nil {
-		if cleanupErr := machine.Delete(instanceID); cleanupErr != nil {
-			return "", fmt.Errorf("failed to save restored sandbox: %w (cleanup failed: %v)", err, cleanupErr)
-		}
-		return "", fmt.Errorf("failed to save restored sandbox: %w", err)
-	}
-
-	if s.metrics != nil {
-		s.metrics.RegisterSandbox(instanceID, sandbox.Name, machine.GetSocketPath(instanceID), cpu, mem, diskMB)
-	}
-
-	return ip, nil
-}
-
-func shouldFallbackToColdRestore(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "cannot open disk path") ||
-		(strings.Contains(msg, "disk path") && strings.Contains(msg, "restore api failed")) ||
-		strings.Contains(msg, "context deadline exceeded") ||
-		strings.Contains(msg, "client.timeout exceeded while awaiting headers") ||
-		strings.Contains(msg, "cannot create virtio-net device") ||
-		strings.Contains(msg, "failed to open taps") ||
-		strings.Contains(msg, "unable to configure tap interface") ||
-		strings.Contains(msg, "resource busy (os error 16)")
-}
-
 func (s *SandboxService) Delete(ctx context.Context, id string) error {
 	if err := machine.Delete(id); err != nil {
 		return fmt.Errorf("delete failed: %w", err)
@@ -459,7 +329,7 @@ func (s *SandboxService) Start(ctx context.Context, id string) error {
 		overlayPath := machine.GetOverlayPath(sbxID)
 
 		// Recreate the VM (boots it automatically)
-		if err := machine.Create(*s.cfg, spec, overlayPath, ""); err != nil {
+		if err := machine.Create(*s.cfg, spec, overlayPath); err != nil {
 			return fmt.Errorf("failed to recreate VM: %w", err)
 		}
 
@@ -584,129 +454,6 @@ func (s *SandboxService) Info(id string) (string, error) {
 	return machine.Info(id)
 }
 
-func (s *SandboxService) CreateSnapshot(id string) error {
-	s.markSnapshotInProgress(id)
-	defer s.unmarkSnapshotInProgress(id)
-	return machine.CreateSnapshot(id)
-}
-
-func (s *SandboxService) ListSnapshots(id string) ([]model.Snapshot, error) {
-	basePath := machine.GetSnapshotsDir(id)
-
-	files, err := os.ReadDir(basePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []model.Snapshot{}, nil
-		}
-		return nil, fmt.Errorf("failed to scan snapshots: %w", err)
-	}
-
-	type snapshotItem struct {
-		snapshot model.Snapshot
-		created  time.Time
-	}
-
-	var items []snapshotItem
-	for _, f := range files {
-		if !f.IsDir() {
-			continue
-		}
-
-		fullPath := filepath.Join(basePath, f.Name())
-		if !isCompleteSnapshotDir(fullPath) {
-			continue
-		}
-
-		createdAt, createdTime := snapshotCreatedAt(f, fullPath)
-		items = append(items, snapshotItem{
-			snapshot: model.Snapshot{
-				ID:        f.Name(),
-				CreatedAt: createdAt,
-				FullPath:  fullPath,
-			},
-			created: createdTime,
-		})
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].created.After(items[j].created)
-	})
-
-	snaps := make([]model.Snapshot, 0, len(items))
-	for _, item := range items {
-		snaps = append(snaps, item.snapshot)
-	}
-
-	return snaps, nil
-}
-
-func (s *SandboxService) DeleteSnapshot(id, snapshotID string) error {
-	if !isSafeSnapshotID(snapshotID) {
-		return ErrInvalidSnapshotID
-	}
-
-	snapshotPath := filepath.Join(machine.GetSnapshotsDir(id), snapshotID)
-	info, err := os.Stat(snapshotPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrSnapshotNotFound
-		}
-		return fmt.Errorf("failed to stat snapshot: %w", err)
-	}
-	if !info.IsDir() {
-		return ErrInvalidSnapshotID
-	}
-
-	if err := os.RemoveAll(snapshotPath); err != nil {
-		return fmt.Errorf("failed to delete snapshot: %w", err)
-	}
-	return nil
-}
-
-func isCompleteSnapshotDir(path string) bool {
-	diskPath := filepath.Join(path, "overlay.qcow2")
-	diskInfo, err := os.Stat(diskPath)
-	if err != nil || diskInfo.IsDir() {
-		return false
-	}
-
-	statePath := filepath.Join(path, "state")
-	stateInfo, err := os.Stat(statePath)
-	return err == nil && stateInfo.IsDir()
-}
-
-func snapshotCreatedAt(entry os.DirEntry, fullPath string) (string, time.Time) {
-	if parsed, err := time.ParseInLocation("20060102-150405", entry.Name(), time.UTC); err == nil {
-		t := parsed.UTC()
-		return t.Format(time.RFC3339), t
-	}
-
-	info, err := entry.Info()
-	if err == nil {
-		t := info.ModTime().UTC()
-		return t.Format(time.RFC3339), t
-	}
-
-	if fallback, statErr := os.Stat(fullPath); statErr == nil {
-		t := fallback.ModTime().UTC()
-		return t.Format(time.RFC3339), t
-	}
-
-	return "", time.Time{}
-}
-
-func isSafeSnapshotID(snapshotID string) bool {
-	snapshotID = strings.TrimSpace(snapshotID)
-	if snapshotID == "" {
-		return false
-	}
-	if strings.Contains(snapshotID, "/") || strings.Contains(snapshotID, "\\") {
-		return false
-	}
-	clean := filepath.Clean(snapshotID)
-	return clean == snapshotID && clean != "." && clean != ".."
-}
-
 // RefreshStatuses checks each sandbox health and updates status field in DB.
 // Status values: running, paused, stopped.
 func (s *SandboxService) RefreshStatuses(ctx context.Context) error {
@@ -791,30 +538,6 @@ func (s *SandboxService) RefreshStatuses(ctx context.Context) error {
 
 	wg.Wait()
 	return nil
-}
-
-func (s *SandboxService) markSnapshotInProgress(id string) {
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
-	s.snapshotsInFlight[id] = struct{}{}
-}
-
-func (s *SandboxService) unmarkSnapshotInProgress(id string) {
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
-	delete(s.snapshotsInFlight, id)
-}
-
-func (s *SandboxService) isSnapshotInProgress(id string) bool {
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
-	_, ok := s.snapshotsInFlight[id]
-	return ok
-}
-
-// GetSnapshotsBasePath returns the base path for snapshots
-func (s *SandboxService) GetSnapshotsBasePath(id string) string {
-	return machine.GetSnapshotsDir(id)
 }
 
 type agentNetConfig struct {

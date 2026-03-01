@@ -1,9 +1,7 @@
 package handler
 
 import (
-	"errors"
 	"net/http"
-	"path/filepath"
 	"strconv"
 
 	"voidrun/internal/model"
@@ -132,50 +130,6 @@ func (h *SandboxHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, model.NewSuccessResponse("Sandbox created", spec))
 }
 
-func (h *SandboxHandler) Restore(c *gin.Context) {
-	var req model.RestoreSandboxRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, model.NewErrorResponse(err.Error(), ""))
-		return
-	}
-
-	// Extract orgID and userID from context
-	orgIDVal, ok := c.Get("orgID")
-	if ok {
-		req.OrgID = orgIDVal.(string)
-	}
-	userIDVal, ok := c.Get("userID")
-	if ok {
-		req.UserID = userIDVal.(string)
-	}
-
-	// Validate CPU count
-	if req.CPU != 0 && (req.CPU < minCPU || req.CPU > maxCPU) {
-		c.JSON(http.StatusBadRequest, model.NewErrorResponse(
-			"invalid cpu count: must be between 1 and 8",
-			"",
-		))
-		return
-	}
-
-	// Validate Memory (MiB)
-	if req.Mem != 0 && (req.Mem < minMemMiB || req.Mem > maxMemMiB) {
-		c.JSON(http.StatusBadRequest, model.NewErrorResponse(
-			"invalid memory size: must be between 1 GiB and 16 GiB",
-			"",
-		))
-		return
-	}
-
-	ip, err := h.sandboxService.Restore(c.Request.Context(), req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.NewErrorResponse(err.Error(), ""))
-		return
-	}
-
-	c.JSON(http.StatusCreated, model.NewSuccessResponse("Sandbox restored", gin.H{"ip": ip}))
-}
-
 func (h *SandboxHandler) Get(c *gin.Context) {
 	id := c.Param("id")
 
@@ -235,50 +189,6 @@ func (h *SandboxHandler) Resume(c *gin.Context) {
 	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox resumed", nil))
 }
 
-func (h *SandboxHandler) Snapshot(c *gin.Context) {
-	id := c.Param("id")
-
-	if err := h.sandboxService.CreateSnapshot(id); err != nil {
-		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("Snapshot failed", err.Error()))
-		return
-	}
-
-	c.JSON(http.StatusOK, model.NewSuccessResponse("Snapshot created", gin.H{
-		"base_path": h.sandboxService.GetSnapshotsBasePath(id),
-	}))
-}
-
-func (h *SandboxHandler) ListSnapshots(c *gin.Context) {
-	id := c.Param("id")
-
-	snaps, err := h.sandboxService.ListSnapshots(id)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.NewErrorResponse("Failed to scan snapshots", ""))
-		return
-	}
-
-	c.JSON(http.StatusOK, snaps)
-}
-
-func (h *SandboxHandler) DeleteSnapshot(c *gin.Context) {
-	id := c.Param("id")
-	snapshotID := c.Param("snapshotId")
-
-	if err := h.sandboxService.DeleteSnapshot(id, snapshotID); err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidSnapshotID):
-			c.JSON(http.StatusBadRequest, model.NewErrorResponse("invalid snapshot id", ""))
-		case errors.Is(err, service.ErrSnapshotNotFound):
-			c.JSON(http.StatusNotFound, model.NewErrorResponse("snapshot not found", ""))
-		default:
-			c.JSON(http.StatusInternalServerError, model.NewErrorResponse("failed to delete snapshot", err.Error()))
-		}
-		return
-	}
-
-	c.JSON(http.StatusOK, model.NewSuccessResponse("Snapshot deleted", nil))
-}
-
 func (h *SandboxHandler) Upload(c *gin.Context) {
 	id := c.Param("id")
 
@@ -335,9 +245,4 @@ func (h *SandboxHandler) sandboxAction(c *gin.Context, action string, fn func(st
 	}
 
 	c.JSON(http.StatusOK, model.NewSuccessResponse("Sandbox "+action+"d", nil))
-}
-
-func GetSnapshotsBasePath(id string) string {
-	pwd, _ := filepath.Abs(".")
-	return filepath.Join(pwd, "instances", id, "snapshots")
 }

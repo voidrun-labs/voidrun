@@ -33,4 +33,3 @@ voidrun
 api-client/
 build-api-client.sh
 *.log
-*test.go

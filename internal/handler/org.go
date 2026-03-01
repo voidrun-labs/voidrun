@@ -74,7 +74,7 @@ func (h *OrgHandler) GetCurrentOrg(c *gin.Context) {
 		}
 	}
 
-	_, allOrgs, err := h.orgService.GetCurrentOrg(c.Request.Context(), orgID, userID)
+	allOrgs, err := h.orgService.GetCurrentOrg(c.Request.Context(), orgID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, model.NewErrorResponse(err.Error(), ""))
 		return

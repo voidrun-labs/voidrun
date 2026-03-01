@@ -15,11 +15,10 @@ type ServerConfig struct {
 
 // Paths configuration
 type PathsConfig struct {
-	BaseImagesDir       string
-	InstancesDir        string
-	KernelPath          string
-	InitrdPath          string
-	DefaultBaseSnapshot string
+	BaseImagesDir string
+	InstancesDir  string
+	KernelPath    string
+	InitrdPath    string
 }
 
 // Network configuration
@@ -106,7 +105,6 @@ const (
 	DefaultBaseImagesDir = "/var/lib/voidrun/base-images"
 	DefaultInstancesDir  = "/var/lib/voidrun/instances"
 	DefaultKernelPath    = "/var/lib/voidrun/base-images/vmlinux"
-	DefaultBaseSnapshot  = "/var/lib/voidrun/snapshots/defaultDebian/"
 	DefaultInitrdPath    = ""
 	DefaultBridgeName    = "vmbr0"
 	DefaultTapPrefix     = "ttap-"
@@ -167,11 +165,10 @@ func New() *Config {
 			Host: getEnv("SERVER_HOST", DefaultServerHost),
 		},
 		Paths: PathsConfig{
-			BaseImagesDir:       getEnv("BASE_IMAGES_DIR", DefaultBaseImagesDir),
-			InstancesDir:        getEnv("INSTANCES_DIR", DefaultInstancesDir),
-			KernelPath:          getEnv("KERNEL_PATH", DefaultKernelPath),
-			InitrdPath:          getEnv("INITRD_PATH", DefaultInitrdPath),
-			DefaultBaseSnapshot: getEnv("DEFAULT_BASE_SNAPSHOT", DefaultBaseSnapshot),
+			BaseImagesDir: getEnv("BASE_IMAGES_DIR", DefaultBaseImagesDir),
+			InstancesDir:  getEnv("INSTANCES_DIR", DefaultInstancesDir),
+			KernelPath:    getEnv("KERNEL_PATH", DefaultKernelPath),
+			InitrdPath:    getEnv("INITRD_PATH", DefaultInitrdPath),
 		},
 		Network: NetworkConfig{
 			BridgeName:  getEnv("BRIDGE_NAME", DefaultBridgeName),

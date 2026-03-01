@@ -34,10 +34,3 @@ type SandboxSpec struct {
 	TapName    string            `json:"tap_name"`
 	MacAddress string            `json:"mac_address"`
 }
-
-// Snapshot represents a sandbox snapshot summary
-type Snapshot struct {
-	ID        string `json:"id"`
-	CreatedAt string `json:"created_at"`
-	FullPath  string `json:"full_path"`
-}
