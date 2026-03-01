@@ -70,7 +70,7 @@ func (r *OrgRepository) FindByID(ctx context.Context, id primitive.ObjectID) (*m
 }
 
 func (r *OrgRepository) FindByMember(ctx context.Context, memberID primitive.ObjectID) ([]*model.Organization, error) {
-	cursor, err := r.collection.Find(ctx, bson.M{"members": memberID}, options.Find().SetSort(bson.M{"createdAt": -1}))
+	cursor, err := r.collection.Find(ctx, bson.M{"members": memberID}, options.Find().SetSort(bson.M{"_id": -1}))
 	if err != nil {
 		return nil, err
 	}

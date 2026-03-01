@@ -78,7 +78,7 @@ func (s *SandboxService) ListByOrgPaginated(ctx context.Context, orgIDHex string
 	opts := options.FindOptions{}
 	opts.SetSkip(skip)
 	opts.SetLimit(int64(pageSize))
-	opts.SetSort(bson.D{{Key: "createdAt", Value: -1}}) // Sort by createdAt descending (latest first)
+	opts.SetSort(bson.D{{Key: "_id", Value: -1}}) // Sort by _id descending (latest first, uses default index)
 	opts.SetProjection(bson.M{
 		"_id":       1,
 		"name":      1,
@@ -109,7 +109,7 @@ func (s *SandboxService) ListByOrg(ctx context.Context, orgIDHex string) ([]*mod
 	filter := bson.M{"orgId": orgID}
 	// Use projection to fetch only essential fields for list view
 	opts := options.FindOptions{}
-	opts.SetSort(bson.D{{Key: "createdAt", Value: -1}}) // Sort by createdAt descending (latest first)
+	opts.SetSort(bson.D{{Key: "_id", Value: -1}}) // Sort by _id descending (latest first, uses default index)
 	opts.SetProjection(bson.M{
 		"_id":       1,
 		"name":      1,
